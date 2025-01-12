@@ -12,6 +12,7 @@ from aiogram.types import (KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMa
 import aiosqlite
 from dotenv import load_dotenv
 import os
+from datetime import datetime
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -21,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Инициализация бота и диспетчера
-API_TOKEN = os.getenv('API_TOKEN')  # Считывание токена из окружения
+API_TOKEN = os.getenv('API_TOKEN')
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -50,15 +51,16 @@ class UserResponse:
 
 user_responses = {}
 
-# Меню
+# Меню (обновленное)
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Начать опрос")]
+        [KeyboardButton(text="Начать опрос")],
+        [KeyboardButton(text="Моя история")]
     ],
     resize_keyboard=True
 )
 
-# Клавиатура для оценки состояний (изменен порядок кнопок)
+# Клавиатура для оценки состояний
 rating_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="+3", callback_data="rate:3")],
@@ -97,6 +99,49 @@ async def start_survey(message: types.Message, state: FSMContext):
         await send_question(message.chat.id, user_id)
     else:
         await message.answer("Извините, в данный момент опрос недоступен. Попробуйте позже.")
+
+
+@dp.message(F.text == "Моя история")
+async def show_history(message: types.Message):
+    user_id = message.from_user.id
+    try:
+        async with aiosqlite.connect('survey.db') as db:
+            db.row_factory = aiosqlite.Row  # Это позволит обращаться к столбцам по именам
+            async with db.execute(
+                    '''SELECT well_being, activity, mood, timestamp 
+                       FROM survey_results 
+                       WHERE user_id = ? 
+                       ORDER BY timestamp DESC 
+                       LIMIT 5''',
+                    (user_id,)
+            ) as cursor:
+                results = await cursor.fetchall()
+
+        if not results:
+            await message.answer("У вас пока нет истории прохождения опросов.", reply_markup=main_menu)
+            return
+
+        # Формируем сообщение с историей
+        history_message = "Ваша история последних 5 опросов:\n\n"
+        for i, result in enumerate(results, 1):
+            timestamp = datetime.strptime(result['timestamp'], '%Y-%m-%d %H:%M:%S')
+            formatted_date = timestamp.strftime('%d.%m.%Y %H:%M')
+            history_message += (
+                f"{i}. Дата: {formatted_date}\n"
+                f"   Самочувствие: {result['well_being']:.1f}\n"
+                f"   Активность: {result['activity']:.1f}\n"
+                f"   Настроение: {result['mood']:.1f}\n"
+                f"   {'=' * 20}\n"
+            )
+
+        await message.answer(history_message, reply_markup=main_menu)
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении истории: {e}")
+        await message.answer(
+            "Произошла ошибка при получении истории. Пожалуйста, попробуйте позже.",
+            reply_markup=main_menu
+        )
 
 
 async def send_question(chat_id, user_id):
