@@ -22,8 +22,13 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # Загрузка вопросов из CSV
-questions_df = pd.read_csv('questions.csv')
-TOTAL_QUESTIONS = len(questions_df)
+try:
+    questions_df = pd.read_csv('questions.csv')
+    TOTAL_QUESTIONS = len(questions_df)
+except Exception as e:
+    logger.error(f"Ошибка при загрузке CSV файла: {e}")
+    questions_df = None
+    TOTAL_QUESTIONS = 0
 
 
 # FSM для опроса
@@ -80,10 +85,13 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text == "Начать опрос")
 async def start_survey(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    user_responses[user_id] = UserResponse()
-    await SurveyForm.answering.set()
-    await send_question(message.chat.id, user_id)
+    if not questions_df is None:
+        user_id = message.from_user.id
+        user_responses[user_id] = UserResponse()
+        await state.set_state(SurveyForm.answering)
+        await send_question(message.chat.id, user_id)
+    else:
+        await message.answer("Извините, в данный момент опрос недоступен. Попробуйте позже.")
 
 
 async def send_question(chat_id, user_id):
@@ -116,6 +124,7 @@ async def process_answer(callback_query: types.CallbackQuery, state: FSMContext)
     if user_response.current_question < TOTAL_QUESTIONS:
         await send_question(callback_query.message.chat.id, user_id)
     else:
+        await state.clear()
         await process_results(callback_query.message.chat.id, user_id)
 
 
@@ -132,48 +141,56 @@ async def process_results(chat_id, user_id):
     activity = (activity + 30) / 10
     mood = (mood + 30) / 10
 
-    # Сохранение результатов в БД
-    async with aiosqlite.connect('survey.db') as db:
-        await db.execute(
-            'CREATE TABLE IF NOT EXISTS survey_results (user_id INTEGER, well_being REAL, activity REAL, mood REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)',
-        )
-        await db.execute(
-            'INSERT INTO survey_results (user_id, well_being, activity, mood) VALUES (?, ?, ?, ?)',
-            (user_id, well_being, activity, mood)
-        )
-        await db.commit()
-
-    # Отправка результатов пользователю
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"Результаты опроса:\n"
-             f"Самочувствие: {well_being:.1f}\n"
-             f"Активность: {activity:.1f}\n"
-             f"Настроение: {mood:.1f}\n\n"
-             f"Норма: 5.0-5.5 баллов",
-        reply_markup=main_menu
-    )
-
-    # Очистка данных пользователя
-    del user_responses[user_id]
-
-
-# Инициализация базы данных при запуске
-async def init_db():
-    async with aiosqlite.connect('survey.db') as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS survey_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                well_being REAL,
-                activity REAL,
-                mood REAL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    try:
+        # Сохранение результатов в БД
+        async with aiosqlite.connect('survey.db') as db:
+            await db.execute(
+                'INSERT INTO survey_results (user_id, well_being, activity, mood) VALUES (?, ?, ?, ?)',
+                (user_id, well_being, activity, mood)
             )
-            """
+            await db.commit()
+
+        # Отправка результатов пользователю
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"Результаты опроса:\n"
+                 f"Самочувствие: {well_being:.1f}\n"
+                 f"Активность: {activity:.1f}\n"
+                 f"Настроение: {mood:.1f}\n\n"
+                 f"Норма: 5.0-5.5 баллов",
+            reply_markup=main_menu
         )
-        await db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении результатов: {e}")
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Произошла ошибка при сохранении результатов. Пожалуйста, попробуйте позже.",
+            reply_markup=main_menu
+        )
+    finally:
+        # Очистка данных пользователя
+        del user_responses[user_id]
+
+
+# Инициализация базы данных
+async def init_db():
+    try:
+        async with aiosqlite.connect('survey.db') as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS survey_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    well_being REAL,
+                    activity REAL,
+                    mood REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации базы данных: {e}")
 
 
 async def main():
