@@ -10,13 +10,18 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton)
 import aiosqlite
+from dotenv import load_dotenv
+import os
+
+# Загружаем переменные окружения из .env файла
+load_dotenv()
 
 # Настройки логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Инициализация бота и диспетчера
-API_TOKEN = '7669085391:AAEP3ehqpCPYJRvxHV-Nn2jCI28szTn0CvE'  # Замените на ваш токен
+API_TOKEN = os.getenv('API_TOKEN')  # Считывание токена из окружения
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -53,16 +58,16 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Клавиатура для оценки состояний
+# Клавиатура для оценки состояний (изменен порядок кнопок)
 rating_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text="-3", callback_data="rate:-3")],
-        [InlineKeyboardButton(text="-2", callback_data="rate:-2")],
-        [InlineKeyboardButton(text="-1", callback_data="rate:-1")],
-        [InlineKeyboardButton(text="0", callback_data="rate:0")],
-        [InlineKeyboardButton(text="+1", callback_data="rate:1")],
-        [InlineKeyboardButton(text="+2", callback_data="rate:2")],
         [InlineKeyboardButton(text="+3", callback_data="rate:3")],
+        [InlineKeyboardButton(text="+2", callback_data="rate:2")],
+        [InlineKeyboardButton(text="+1", callback_data="rate:1")],
+        [InlineKeyboardButton(text="0", callback_data="rate:0")],
+        [InlineKeyboardButton(text="-1", callback_data="rate:-1")],
+        [InlineKeyboardButton(text="-2", callback_data="rate:-2")],
+        [InlineKeyboardButton(text="-3", callback_data="rate:-3")],
     ]
 )
 
