@@ -13,6 +13,7 @@ import aiosqlite
 from dotenv import load_dotenv
 import os
 from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -26,6 +27,9 @@ API_TOKEN = os.getenv('API_TOKEN')
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Инициализация планировщика
+scheduler = AsyncIOScheduler()
 
 # Загрузка вопросов из CSV
 try:
@@ -268,11 +272,60 @@ async def init_db():
         logger.error(f"Ошибка при инициализации базы данных: {e}")
 
 
+async def send_reminder():
+    """Отправка напоминаний всем зарегистрированным пользователям"""
+    try:
+        async with aiosqlite.connect('users.db') as db:
+            async with db.execute("SELECT user_id, name FROM users") as cursor:
+                users = await cursor.fetchall()
+
+        for user_id, name in users:
+            try:
+                # Проверяем, когда пользователь последний раз проходил опрос
+                async with aiosqlite.connect('survey.db') as db:
+                    async with db.execute(
+                            """
+                            SELECT timestamp 
+                            FROM survey_results 
+                            WHERE user_id = ? 
+                            ORDER BY timestamp DESC 
+                            LIMIT 1
+                            """,
+                            (user_id,)
+                    ) as cursor:
+                        last_survey = await cursor.fetchone()
+
+                if not last_survey:
+                    message_text = f"{name}, вы еще ни разу не проходили опрос САН. Предлагаю сделать это сейчас!"
+                else:
+                    message_text = f"{name}, пришло время снова пройти опрос САН!"
+
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=message_text,
+                    reply_markup=main_menu
+                )
+                logger.info(f"Отправлено напоминание пользователю {user_id}")
+
+            except Exception as e:
+                logger.error(f"Ошибка при отправке напоминания пользователю {user_id}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке напоминаний: {e}")
+
+
 async def main():
     # Создаем базу данных пользователей
     await create_user_database()
     # Инициализируем базу данных для результатов
     await init_db()
+
+    # Настраиваем периодическое напоминание
+    reminder_interval = int(os.getenv('REMINDER_INTERVAL', '60'))  # значение в минутах, по умолчанию 60
+    scheduler.add_job(send_reminder, 'interval', minutes=reminder_interval)
+    scheduler.start()
+
     # Запускаем бота
     await dp.start_polling(bot)
 
@@ -282,3 +335,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.error("Бот остановлен!")
+        scheduler.shutdown()
