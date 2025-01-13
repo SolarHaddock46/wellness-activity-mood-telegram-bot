@@ -2,7 +2,7 @@ import asyncio
 import logging
 import pandas as pd
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
@@ -42,6 +42,11 @@ class SurveyForm(StatesGroup):
     answering = State()
 
 
+# FSM для регистрации
+class RegistrationForm(StatesGroup):
+    name = State()
+
+
 # Словарь для хранения ответов пользователя
 class UserResponse:
     def __init__(self):
@@ -49,13 +54,14 @@ class UserResponse:
         self.answers = {}
 
 
+# Хранилище ответов пользователей
 user_responses = {}
 
-# Меню (обновленное)
+# Клавиатура для основного меню
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Начать опрос")],
-        [KeyboardButton(text="Моя история")]
+        [KeyboardButton(text="Мои результаты")]
     ],
     resize_keyboard=True
 )
@@ -63,36 +69,69 @@ main_menu = ReplyKeyboardMarkup(
 # Клавиатура для оценки состояний
 rating_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text="+3", callback_data="rate:3")],
-        [InlineKeyboardButton(text="+2", callback_data="rate:2")],
-        [InlineKeyboardButton(text="+1", callback_data="rate:1")],
-        [InlineKeyboardButton(text="0", callback_data="rate:0")],
-        [InlineKeyboardButton(text="-1", callback_data="rate:-1")],
-        [InlineKeyboardButton(text="-2", callback_data="rate:-2")],
-        [InlineKeyboardButton(text="-3", callback_data="rate:-3")],
+        [InlineKeyboardButton(text=str(i), callback_data=f"rate:{i}")
+         for i in range(3, -4, -1)]
     ]
 )
 
 
+async def create_user_database():
+    async with aiosqlite.connect('users.db') as db:
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        await db.commit()
+
+
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    async with aiosqlite.connect('users.db') as db:
+        async with db.execute(
+                "SELECT name FROM users WHERE user_id = ?",
+                (user_id,)
+        ) as cursor:
+            user = await cursor.fetchone()
+
+    if user:
+        await message.answer(
+            f"С возвращением, {user[0]}!",
+            reply_markup=main_menu
+        )
+    else:
+        await state.set_state(RegistrationForm.name)
+        await message.answer("Добро пожаловать! Как вас зовут?")
+
+
+@dp.message(StateFilter(RegistrationForm.name))
+async def process_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 2 or len(name) > 50:
+        await message.answer("Введите корректное имя (от 2 до 50 символов)")
+        return
+
+    async with aiosqlite.connect('users.db') as db:
+        await db.execute(
+            "INSERT INTO users (user_id, name) VALUES (?, ?)",
+            (message.from_user.id, name)
+        )
+        await db.commit()
+
+    await state.clear()
     await message.answer(
-        "Привет! Давайте начнем опрос по методике 'Ситуация-Активность-Настроение'.\n"
-        "В опросе вам будет предложено оценить различные состояния по шкале от -3 до +3, где:\n"
-        "+3 - состояние наиболее типично\n"
-        "+2 - состояние довольно типично\n"
-        "+1 - состояние встречается чаще, чем противоположное\n"
-        "0 - трудно сказать\n"
-        "-1 - противоположное состояние встречается чаще\n"
-        "-2 - противоположное состояние довольно типично\n"
-        "-3 - противоположное состояние наиболее типично",
+        f"Приятно познакомиться, {name}!",
         reply_markup=main_menu
     )
 
 
 @dp.message(F.text == "Начать опрос")
 async def start_survey(message: types.Message, state: FSMContext):
-    if not questions_df is None:
+    if questions_df is not None:
         user_id = message.from_user.id
         user_responses[user_id] = UserResponse()
         await state.set_state(SurveyForm.answering)
@@ -101,72 +140,51 @@ async def start_survey(message: types.Message, state: FSMContext):
         await message.answer("Извините, в данный момент опрос недоступен. Попробуйте позже.")
 
 
-@dp.message(F.text == "Моя история")
-async def show_history(message: types.Message):
+@dp.message(F.text == "Мои результаты")
+async def show_results(message: types.Message):
     user_id = message.from_user.id
     try:
         async with aiosqlite.connect('survey.db') as db:
-            db.row_factory = aiosqlite.Row  # Это позволит обращаться к столбцам по именам
             async with db.execute(
-                    '''SELECT well_being, activity, mood, timestamp 
-                       FROM survey_results 
-                       WHERE user_id = ? 
-                       ORDER BY timestamp DESC 
-                       LIMIT 5''',
+                    """
+                    SELECT well_being, activity, mood, timestamp 
+                    FROM survey_results 
+                    WHERE user_id = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT 1
+                    """,
                     (user_id,)
             ) as cursor:
-                results = await cursor.fetchall()
+                result = await cursor.fetchone()
 
-        if not results:
-            await message.answer("У вас пока нет истории прохождения опросов.", reply_markup=main_menu)
-            return
-
-        # Формируем сообщение с историей
-        history_message = "Ваша история последних 5 опросов:\n\n"
-        for i, result in enumerate(results, 1):
-            timestamp = datetime.strptime(result['timestamp'], '%Y-%m-%d %H:%M:%S')
-            formatted_date = timestamp.strftime('%d.%m.%Y %H:%M')
-            history_message += (
-                f"{i}. Дата: {formatted_date}\n"
-                f"   Самочувствие: {result['well_being']:.1f}\n"
-                f"   Активность: {result['activity']:.1f}\n"
-                f"   Настроение: {result['mood']:.1f}\n"
-                f"   {'=' * 20}\n"
+        if result:
+            well_being, activity, mood, timestamp = result
+            await message.answer(
+                f"Ваши последние результаты:\n"
+                f"Дата: {timestamp}\n"
+                f"Самочувствие: {well_being:.1f}\n"
+                f"Активность: {activity:.1f}\n"
+                f"Настроение: {mood:.1f}\n\n"
+                f"Норма: 5.0-5.5 баллов"
             )
-
-        await message.answer(history_message, reply_markup=main_menu)
-
+        else:
+            await message.answer("У вас пока нет результатов. Пройдите опрос, чтобы увидеть свои показатели.")
     except Exception as e:
-        logger.error(f"Ошибка при получении истории: {e}")
-        await message.answer(
-            "Произошла ошибка при получении истории. Пожалуйста, попробуйте позже.",
-            reply_markup=main_menu
-        )
+        logger.error(f"Ошибка при получении результатов: {e}")
+        await message.answer("Произошла ошибка при получении результатов. Попробуйте позже.")
 
 
-async def send_question(chat_id, user_id):
-    user_response = user_responses[user_id]
-    if user_response.current_question < TOTAL_QUESTIONS:
-        question = questions_df.iloc[user_response.current_question]
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"{question['positive']} или {question['negative']}?",
-            reply_markup=rating_keyboard
-        )
-    else:
-        await process_results(chat_id, user_id)
-
-
-@dp.callback_query(SurveyForm.answering)
-async def process_answer(callback_query: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("rate:"))
+async def process_survey_answer(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
+    if user_id not in user_responses:
+        await callback_query.message.answer("Произошла ошибка. Пожалуйста, начните опрос заново.")
+        return
+
     rating = int(callback_query.data.split(":")[1])
-
     user_response = user_responses[user_id]
-    question = questions_df.iloc[user_response.current_question]
-
-    # Сохраняем ответ
-    user_response.answers[question['number']] = rating
+    current_question = questions_df.iloc[user_response.current_question]
+    user_response.answers[current_question['number']] = rating
     user_response.current_question += 1
 
     await callback_query.answer()
@@ -174,8 +192,19 @@ async def process_answer(callback_query: types.CallbackQuery, state: FSMContext)
     if user_response.current_question < TOTAL_QUESTIONS:
         await send_question(callback_query.message.chat.id, user_id)
     else:
-        await state.clear()
         await process_results(callback_query.message.chat.id, user_id)
+
+
+async def send_question(chat_id: int, user_id: int):
+    user_response = user_responses[user_id]
+    if user_response.current_question < TOTAL_QUESTIONS:
+        question = questions_df.iloc[user_response.current_question]
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"Вопрос {user_response.current_question + 1} из {TOTAL_QUESTIONS}\n\n"
+                 f"{question['positive']} или {question['negative']}?",
+            reply_markup=rating_keyboard
+        )
 
 
 async def process_results(chat_id, user_id):
@@ -192,7 +221,6 @@ async def process_results(chat_id, user_id):
     mood = (mood + 30) / 10
 
     try:
-        # Сохранение результатов в БД
         async with aiosqlite.connect('survey.db') as db:
             await db.execute(
                 'INSERT INTO survey_results (user_id, well_being, activity, mood) VALUES (?, ?, ?, ?)',
@@ -200,7 +228,6 @@ async def process_results(chat_id, user_id):
             )
             await db.commit()
 
-        # Отправка результатов пользователю
         await bot.send_message(
             chat_id=chat_id,
             text=f"Результаты опроса:\n"
@@ -218,11 +245,9 @@ async def process_results(chat_id, user_id):
             reply_markup=main_menu
         )
     finally:
-        # Очистка данных пользователя
         del user_responses[user_id]
 
 
-# Инициализация базы данных
 async def init_db():
     try:
         async with aiosqlite.connect('survey.db') as db:
@@ -244,7 +269,11 @@ async def init_db():
 
 
 async def main():
+    # Создаем базу данных пользователей
+    await create_user_database()
+    # Инициализируем базу данных для результатов
     await init_db()
+    # Запускаем бота
     await dp.start_polling(bot)
 
 

@@ -171,3 +171,4 @@ cython_debug/
 .pypirc
 
 survey.db
+users.db
