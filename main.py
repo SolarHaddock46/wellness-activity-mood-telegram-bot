@@ -16,6 +16,11 @@ import os
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from typing import Any, Awaitable, Callable, Dict
+from gigachat import GigaChat
+from langchain.llms import GigaChat as LangChainGigaChat
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -26,7 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Инициализация бота и диспетчера
 API_TOKEN = os.getenv('API_TOKEN')
+GIGACHAT_CREDENTIALS = os.getenv('GIGACHAT_CREDENTIALS')
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+gigachat = GigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False)
+
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -177,14 +185,15 @@ async def create_user_database():
 async def init_db():
     async with aiosqlite.connect('survey.db') as db:
         await db.execute(
-            """CREATE TABLE IF NOT EXISTS survey_results (
+            '''CREATE TABLE IF NOT EXISTS survey_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 well_being REAL,
                 activity REAL,
                 mood REAL,
+                analysis TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )"""
+            )'''
         )
         await db.commit()
 
@@ -281,24 +290,25 @@ async def show_results(message: Message):
     try:
         async with aiosqlite.connect('survey.db') as db:
             async with db.execute(
-                """SELECT well_being, activity, mood, timestamp 
-                FROM survey_results 
-                WHERE user_id = ? 
-                ORDER BY timestamp DESC 
-                LIMIT 5""",  # показываем последние 5 результатов
-                (user_id,)
+                    """SELECT well_being, activity, mood, analysis, timestamp 
+                    FROM survey_results 
+                    WHERE user_id = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT 5""",
+                    (user_id,)
             ) as cursor:
                 results = await cursor.fetchall()
 
         if results:
             response = "Ваши результаты:\n\n"
-            for well_being, activity, mood, timestamp in results:
+            for well_being, activity, mood, analysis, timestamp in results:
                 response += (
                     f"Дата: {timestamp}\n"
                     f"Самочувствие: {well_being:.1f}\n"
                     f"Активность: {activity:.1f}\n"
                     f"Настроение: {mood:.1f}\n"
-                    f"{'='*20}\n"
+                    f"Анализ: {analysis}\n"
+                    f"{'=' * 20}\n"
                 )
             response += "\nНорма: 5.0-5.5 баллов"
             await message.answer(response)
@@ -342,6 +352,37 @@ async def send_question(chat_id: int, user_id: int):
         )
 
 
+async def analyze_results_with_gigachat(well_being: float, activity: float, mood: float) -> str:
+    prompt = PromptTemplate(
+        input_variables=["well_being", "activity", "mood"],
+        template="""Проанализируй результаты теста САН:
+        Самочувствие: {well_being}
+        Активность: {activity}
+        Настроение: {mood}
+
+        Средний балл шкалы равен 4.
+        Оценки выше 4 баллов говорят о благоприятном состоянии.
+        Оценки ниже 4 баллов говорят о неблагоприятном состоянии.
+        Оценки в диапазоне 5.0-5.5 баллов говорят о нормальном состоянии.
+
+        Проанализируй в какой группе показателей самые высокие и низкие значения.
+        Дай рекомендации по улучшению состояния."""
+    )
+
+    chain = LLMChain(
+        llm=LangChainGigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False),
+        prompt=prompt
+    )
+
+    result = await chain.arun({
+        "well_being": well_being,
+        "activity": activity,
+        "mood": mood
+    })
+
+    return result
+
+
 async def process_results(chat_id: int, user_id: int):
     user_response = user_responses[user_id]
 
@@ -354,14 +395,26 @@ async def process_results(chat_id: int, user_id: int):
     mood = (mood + 30) / 10
 
     try:
+        # Получаем анализ от GigaChat
+        analysis = await analyze_results_with_gigachat(well_being, activity, mood)
         async with aiosqlite.connect('survey.db') as db:
             await db.execute(
-                '''INSERT INTO survey_results 
-                (user_id, well_being, activity, mood) 
-                VALUES (?, ?, ?, ?)''',
-                (user_id, well_being, activity, mood)
+                '''CREATE TABLE IF NOT EXISTS survey_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    well_being REAL,
+                    activity REAL,
+                    mood REAL,
+                    analysis TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )'''
             )
-            await db.commit()
+            await db.execute(
+                '''INSERT INTO survey_results 
+                (user_id, well_being, activity, mood, analysis) 
+                VALUES (?, ?, ?, ?, ?)''',
+                (user_id, well_being, activity, mood, analysis)
+            )
 
         await bot.send_message(
             chat_id=chat_id,
@@ -369,9 +422,11 @@ async def process_results(chat_id: int, user_id: int):
                  f"Самочувствие: {well_being:.1f}\n"
                  f"Активность: {activity:.1f}\n"
                  f"Настроение: {mood:.1f}\n\n"
-                 f"Норма: 5.0-5.5 баллов",
+                 f"Норма: 5.0-5.5 баллов\n\n"
+                 f"Анализ результатов:\n{analysis}",
             reply_markup=main_menu
         )
+
     except Exception as e:
         logger.error(f"Ошибка при сохранении результатов: {e}")
         await bot.send_message(
