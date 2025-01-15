@@ -1,21 +1,23 @@
 import asyncio
 import logging
 import pandas as pd
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command, StateFilter
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton)
+from aiogram.types import (KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMarkup,
+                           InlineKeyboardButton, Message, ReplyKeyboardRemove)
 import aiosqlite
 from dotenv import load_dotenv
 import os
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from typing import Any, Awaitable, Callable, Dict
 
-# Загружаем переменные окружения из .env файла
+# Загружаем переменные окружения
 load_dotenv()
 
 # Настройки логирования
@@ -31,27 +33,115 @@ dp = Dispatcher(storage=storage)
 # Инициализация планировщика
 scheduler = AsyncIOScheduler()
 
-# Загрузка вопросов из CSV
-try:
-    questions_df = pd.read_csv('questions.csv')
-    TOTAL_QUESTIONS = len(questions_df)
-except Exception as e:
-    logger.error(f"Ошибка при загрузке CSV файла: {e}")
-    questions_df = None
-    TOTAL_QUESTIONS = 0
 
-
-# FSM для опроса
-class SurveyForm(StatesGroup):
-    answering = State()
-
-
-# FSM для регистрации
+# FSM States
 class RegistrationForm(StatesGroup):
     name = State()
 
 
-# Словарь для хранения ответов пользователя
+class SurveyForm(StatesGroup):
+    answering = State()
+
+
+# Middleware
+class RegistrationMiddleware(BaseMiddleware):
+    async def __call__(
+            self,
+            handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+            event: Message,
+            data: Dict[str, Any]
+    ) -> Any:
+        # Пропускаем не-сообщения
+        if not isinstance(event, Message):
+            return await handler(event, data)
+
+        # Пропускаем не-текстовые сообщения
+        if not event.text:
+            return await handler(event, data)
+
+        # Проверяем наличие состояния FSM
+        state: FSMContext = data.get("state")
+        if state:
+            current_state = await state.get_state()
+            if current_state == "RegistrationForm:name":
+                return await handler(event, data)
+
+        # Пропускаем команды регистрации
+        if event.text.startswith(('/start', '/register')):
+            return await handler(event, data)
+
+        user_id = event.from_user.id
+
+        # Проверяем регистрацию
+        async with aiosqlite.connect('users.db') as db:
+            async with db.execute(
+                    "SELECT name FROM users WHERE user_id = ?",
+                    (user_id,)
+            ) as cursor:
+                user = await cursor.fetchone()
+
+        if not user:
+            await event.answer("Пожалуйста, зарегистрируйтесь с помощью команды /register")
+            return
+
+        return await handler(event, data)
+
+
+class LoggingMiddleware(BaseMiddleware):
+    async def __call__(
+            self,
+            handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+            event: Message,
+            data: Dict[str, Any]
+    ) -> Any:
+        # Создаем таблицу для логов, если её нет
+        async with aiosqlite.connect('users.db') as db:
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS user_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT,
+                    content TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            await db.commit()
+
+        # Логируем действие пользователя
+        if isinstance(event, Message):
+            user_id = event.from_user.id
+            action = event.text if event.text else 'non-text action'
+
+            async with aiosqlite.connect('users.db') as db:
+                await db.execute(
+                    "INSERT INTO user_actions (user_id, action, content, timestamp) VALUES (?, ?, ?, ?)",
+                    (user_id, action, str(event), datetime.now())
+                )
+                await db.commit()
+
+            logger.info(f"User {user_id} performed action: {action}")
+
+        return await handler(event, data)
+
+
+# Клавиатуры
+main_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Начать опрос")],
+        [KeyboardButton(text="Мои результаты")]
+    ],
+    resize_keyboard=True
+)
+
+rating_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text=str(i), callback_data=f"rate:{i}")
+         for i in range(-3, 4, 1)]
+    ]
+)
+
+
+# Вспомогательный класс для хранения ответов
 class UserResponse:
     def __init__(self):
         self.current_question = 0
@@ -61,24 +151,17 @@ class UserResponse:
 # Хранилище ответов пользователей
 user_responses = {}
 
-# Клавиатура для основного меню
-main_menu = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Начать опрос")],
-        [KeyboardButton(text="Мои результаты")]
-    ],
-    resize_keyboard=True
-)
-
-# Клавиатура для оценки состояний
-rating_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text=str(i), callback_data=f"rate:{i}")
-         for i in range(3, -4, -1)]
-    ]
-)
+# Загрузка вопросов
+try:
+    questions_df = pd.read_csv('questions.csv')
+    TOTAL_QUESTIONS = len(questions_df)
+except Exception as e:
+    logger.error(f"Ошибка при загрузке CSV файла: {e}")
+    questions_df = None
+    TOTAL_QUESTIONS = 0
 
 
+# Функции баз данных
 async def create_user_database():
     async with aiosqlite.connect('users.db') as db:
         await db.execute(
@@ -91,9 +174,39 @@ async def create_user_database():
         await db.commit()
 
 
+async def init_db():
+    async with aiosqlite.connect('survey.db') as db:
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS survey_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                well_being REAL,
+                activity REAL,
+                mood REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        await db.commit()
+
+
+# Обработчики команд
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: Message):
+    await message.answer(
+        "Добро пожаловать! Используйте команду /register для регистрации.",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+@dp.message(Command("register"))
+async def cmd_register(message: Message, state: FSMContext):
     user_id = message.from_user.id
+
+    # Проверяем текущее состояние
+    current_state = await state.get_state()
+    if current_state == "RegistrationForm:name":
+        await message.answer("Вы уже начали регистрацию. Пожалуйста, введите ваше имя.")
+        return
 
     async with aiosqlite.connect('users.db') as db:
         async with db.execute(
@@ -104,37 +217,55 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     if user:
         await message.answer(
-            f"С возвращением, {user[0]}!",
+            f"Вы уже зарегистрированы как {user[0]}!",
             reply_markup=main_menu
         )
     else:
         await state.set_state(RegistrationForm.name)
-        await message.answer("Добро пожаловать! Как вас зовут?")
+        await message.answer(
+            "Как вас зовут?",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 
 @dp.message(StateFilter(RegistrationForm.name))
-async def process_name(message: types.Message, state: FSMContext):
+async def process_name(message: Message, state: FSMContext):
+    # Игнорируем все команды во время регистрации кроме /cancel
+    if message.text.startswith('/'):
+        return
+
     name = message.text.strip()
     if len(name) < 2 or len(name) > 50:
         await message.answer("Введите корректное имя (от 2 до 50 символов)")
         return
 
-    async with aiosqlite.connect('users.db') as db:
-        await db.execute(
-            "INSERT INTO users (user_id, name) VALUES (?, ?)",
-            (message.from_user.id, name)
-        )
-        await db.commit()
+    user_id = message.from_user.id
 
-    await state.clear()
-    await message.answer(
-        f"Приятно познакомиться, {name}!",
-        reply_markup=main_menu
-    )
+    try:
+        async with aiosqlite.connect('users.db') as db:
+            await db.execute(
+                "INSERT INTO users (user_id, name) VALUES (?, ?)",
+                (user_id, name)
+            )
+            await db.commit()
+
+        await state.clear()
+        await message.answer(
+            f"Приятно познакомиться, {name}!",
+            reply_markup=main_menu
+        )
+        logger.info(f"Новый пользователь зарегистрирован: {user_id} ({name})")
+
+    except Exception as e:
+        logger.error(f"Ошибка при регистрации пользователя: {e}")
+        await message.answer(
+            "Произошла ошибка при регистрации. Пожалуйста, попробуйте еще раз.",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 
 @dp.message(F.text == "Начать опрос")
-async def start_survey(message: types.Message, state: FSMContext):
+async def start_survey(message: Message, state: FSMContext):
     if questions_df is not None:
         user_id = message.from_user.id
         user_responses[user_id] = UserResponse()
@@ -145,32 +276,32 @@ async def start_survey(message: types.Message, state: FSMContext):
 
 
 @dp.message(F.text == "Мои результаты")
-async def show_results(message: types.Message):
+async def show_results(message: Message):
     user_id = message.from_user.id
     try:
         async with aiosqlite.connect('survey.db') as db:
             async with db.execute(
-                    """
-                    SELECT well_being, activity, mood, timestamp 
-                    FROM survey_results 
-                    WHERE user_id = ? 
-                    ORDER BY timestamp DESC 
-                    LIMIT 1
-                    """,
-                    (user_id,)
+                """SELECT well_being, activity, mood, timestamp 
+                FROM survey_results 
+                WHERE user_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT 5""",  # показываем последние 5 результатов
+                (user_id,)
             ) as cursor:
-                result = await cursor.fetchone()
+                results = await cursor.fetchall()
 
-        if result:
-            well_being, activity, mood, timestamp = result
-            await message.answer(
-                f"Ваши последние результаты:\n"
-                f"Дата: {timestamp}\n"
-                f"Самочувствие: {well_being:.1f}\n"
-                f"Активность: {activity:.1f}\n"
-                f"Настроение: {mood:.1f}\n\n"
-                f"Норма: 5.0-5.5 баллов"
-            )
+        if results:
+            response = "Ваши результаты:\n\n"
+            for well_being, activity, mood, timestamp in results:
+                response += (
+                    f"Дата: {timestamp}\n"
+                    f"Самочувствие: {well_being:.1f}\n"
+                    f"Активность: {activity:.1f}\n"
+                    f"Настроение: {mood:.1f}\n"
+                    f"{'='*20}\n"
+                )
+            response += "\nНорма: 5.0-5.5 баллов"
+            await message.answer(response)
         else:
             await message.answer("У вас пока нет результатов. Пройдите опрос, чтобы увидеть свои показатели.")
     except Exception as e:
@@ -178,8 +309,8 @@ async def show_results(message: types.Message):
         await message.answer("Произошла ошибка при получении результатов. Попробуйте позже.")
 
 
-@dp.callback_query(F.data.startswith("rate:"))
-async def process_survey_answer(callback_query: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(lambda c: c.data.startswith("rate:"))
+async def process_rating(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
     if user_id not in user_responses:
         await callback_query.message.answer("Произошла ошибка. Пожалуйста, начните опрос заново.")
@@ -206,20 +337,18 @@ async def send_question(chat_id: int, user_id: int):
         await bot.send_message(
             chat_id=chat_id,
             text=f"Вопрос {user_response.current_question + 1} из {TOTAL_QUESTIONS}\n\n"
-                 f"{question['positive']} или {question['negative']}?",
+                 f"{question['negative']} или {question['positive']}?",
             reply_markup=rating_keyboard
         )
 
 
-async def process_results(chat_id, user_id):
+async def process_results(chat_id: int, user_id: int):
     user_response = user_responses[user_id]
 
-    # Подсчет результатов по категориям
     well_being = sum(user_response.answers[i] for i in range(1, 31) if i in [1, 2, 7, 8, 13, 14, 19, 20, 25, 26])
     activity = sum(user_response.answers[i] for i in range(1, 31) if i in [3, 4, 9, 10, 15, 16, 21, 22, 27, 28])
     mood = sum(user_response.answers[i] for i in range(1, 31) if i in [5, 6, 11, 12, 17, 18, 23, 24, 29, 30])
 
-    # Преобразование в 7-балльную шкалу
     well_being = (well_being + 30) / 10
     activity = (activity + 30) / 10
     mood = (mood + 30) / 10
@@ -227,7 +356,9 @@ async def process_results(chat_id, user_id):
     try:
         async with aiosqlite.connect('survey.db') as db:
             await db.execute(
-                'INSERT INTO survey_results (user_id, well_being, activity, mood) VALUES (?, ?, ?, ?)',
+                '''INSERT INTO survey_results 
+                (user_id, well_being, activity, mood) 
+                VALUES (?, ?, ?, ?)''',
                 (user_id, well_being, activity, mood)
             )
             await db.commit()
@@ -252,26 +383,7 @@ async def process_results(chat_id, user_id):
         del user_responses[user_id]
 
 
-async def init_db():
-    try:
-        async with aiosqlite.connect('survey.db') as db:
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS survey_results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    well_being REAL,
-                    activity REAL,
-                    mood REAL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            await db.commit()
-    except Exception as e:
-        logger.error(f"Ошибка при инициализации базы данных: {e}")
-
-
+# Напоминания
 async def send_reminder():
     """Отправка напоминаний всем зарегистрированным пользователям"""
     try:
@@ -281,16 +393,13 @@ async def send_reminder():
 
         for user_id, name in users:
             try:
-                # Проверяем, когда пользователь последний раз проходил опрос
                 async with aiosqlite.connect('survey.db') as db:
                     async with db.execute(
-                            """
-                            SELECT timestamp 
+                            """SELECT timestamp 
                             FROM survey_results 
                             WHERE user_id = ? 
                             ORDER BY timestamp DESC 
-                            LIMIT 1
-                            """,
+                            LIMIT 1""",
                             (user_id,)
                     ) as cursor:
                         last_survey = await cursor.fetchone()
@@ -315,14 +424,18 @@ async def send_reminder():
         logger.error(f"Ошибка при отправке напоминаний: {e}")
 
 
+# Запуск бота
 async def main():
-    # Создаем базу данных пользователей
+    # Создаем базы данных
     await create_user_database()
-    # Инициализируем базу данных для результатов
     await init_db()
 
+    # Регистрируем middleware
+    dp.message.middleware.register(RegistrationMiddleware())
+    dp.message.middleware.register(LoggingMiddleware())
+
     # Настраиваем периодическое напоминание
-    reminder_interval = int(os.getenv('REMINDER_INTERVAL', '60'))  # значение в минутах, по умолчанию 60
+    reminder_interval = int(os.getenv('REMINDER_INTERVAL', '60'))
     scheduler.add_job(send_reminder, 'interval', minutes=reminder_interval)
     scheduler.start()
 
