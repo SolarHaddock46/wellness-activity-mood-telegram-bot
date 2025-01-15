@@ -136,10 +136,12 @@ class LoggingMiddleware(BaseMiddleware):
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Начать опрос")],
-        [KeyboardButton(text="Мои результаты")]
+        [KeyboardButton(text="Мои результаты")],
+        [KeyboardButton(text="Анализ динамики")]
     ],
     resize_keyboard=True
 )
+
 
 rating_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -319,6 +321,28 @@ async def show_results(message: Message):
         await message.answer("Произошла ошибка при получении результатов. Попробуйте позже.")
 
 
+@dp.message(F.text == "Анализ динамики")
+async def cmd_analyze_trends(message: Message):
+    """Анализ трендов в изменении показателей САН"""
+    user_id = message.from_user.id
+
+    # Проверяем регистрацию пользователя
+    async with aiosqlite.connect('users.db') as db:
+        async with db.execute(
+                "SELECT name FROM users WHERE user_id = ?",
+                (user_id,)
+        ) as cursor:
+            user = await cursor.fetchone()
+
+    if not user:
+        await message.answer(
+            "Пожалуйста, сначала зарегистрируйтесь с помощью команды /register"
+        )
+        return
+
+    await analyze_trends_with_gigachat(message.chat.id, user_id)
+
+
 @dp.callback_query(lambda c: c.data.startswith("rate:"))
 async def process_rating(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
@@ -476,6 +500,85 @@ async def process_results(chat_id: int, user_id: int):
         )
     finally:
         del user_responses[user_id]
+
+async def analyze_trends_with_gigachat(chat_id: int, user_id: int, num_last_results: int = 5) -> None:
+    try:
+        # Получаем последние результаты из БД
+        async with aiosqlite.connect('survey.db') as db:
+            async with db.execute(
+                '''SELECT well_being, activity, mood, timestamp 
+                FROM survey_results 
+                WHERE user_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?''',
+                (user_id, num_last_results)
+            ) as cursor:
+                results = await cursor.fetchall()
+
+        if not results:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Недостаточно данных для анализа трендов. Необходимо пройти несколько измерений."
+            )
+            return
+
+        # Форматируем данные для анализа
+        formatted_data = []
+        for well_being, activity, mood, timestamp in results:
+            formatted_data.append(
+                f"Дата: {timestamp}\n"
+                f"Самочувствие: {well_being:.1f}\n"
+                f"Активность: {activity:.1f}\n"
+                f"Настроение: {mood:.1f}\n"
+            )
+
+        # Создаем промпт для GigaChat
+        prompt = PromptTemplate(
+            input_variables=["measurements"],
+            template="""Ты - опытный психолог-аналитик. Проанализируй изменения в показателях САН (самочувствие, активность, настроение) за последние измерения.
+
+            Данные измерений (от новых к старым):
+            {measurements}
+            
+            Задачи анализа:
+            1. Определи тренды изменения каждого показателя
+            2. Оцени стабильность показателей
+            3. Выяви возможные причины изменений
+            4. Определи потенциальные риски при текущей динамике
+            5. Предложи рекомендации с учетом наблюдаемых изменений
+            
+            При анализе обрати внимание на:
+            - Резкие изменения показателей
+            - Устойчивые тренды
+            - Взаимосвязь изменений разных показателей
+            - Цикличность изменений
+            
+            Сформулируй анализ так, как если бы ты объяснял динамику показателей при личной консультации. Обращайся к пользователю на Вы.
+            При этом не пиши никаких приветственных сообщений или введений, переходи сразу к сути."""
+        )
+
+        # Получаем анализ от GigaChat
+        chain = LLMChain(
+            llm=LangChainGigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False),
+            prompt=prompt
+        )
+
+        analysis = await chain.arun({
+            "measurements": "\n---\n".join(formatted_data)
+        })
+
+        # Отправляем результат анализа
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"Анализ динамики показателей САН за последние {len(results)} измерений:\n\n{analysis}"
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при анализе трендов: {e}")
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Произошла ошибка при анализе трендов. Пожалуйста, попробуйте позже."
+        )
 
 
 # Напоминания
