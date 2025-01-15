@@ -355,18 +355,35 @@ async def send_question(chat_id: int, user_id: int):
 async def analyze_results_with_gigachat(well_being: float, activity: float, mood: float) -> str:
     prompt = PromptTemplate(
         input_variables=["well_being", "activity", "mood"],
-        template="""Проанализируй результаты теста САН:
+        template="""Ты - опытный психолог-аналитик, специализирующийся на оценке психоэмоционального состояния. Используй следующие данные опросника САН:
+
         Самочувствие: {well_being}
         Активность: {activity}
         Настроение: {mood}
-
-        Средний балл шкалы равен 4.
-        Оценки выше 4 баллов говорят о благоприятном состоянии.
-        Оценки ниже 4 баллов говорят о неблагоприятном состоянии.
-        Оценки в диапазоне 5.0-5.5 баллов говорят о нормальном состоянии.
-
-        Проанализируй в какой группе показателей самые высокие и низкие значения.
-        Дай рекомендации по улучшению состояния."""
+                
+        Задачи:
+        1. Проанализируй взаимосвязь между показателями
+        2. Определи возможные причины текущего состояния
+        3. Оцени риски при данной комбинации показателей
+        4. Предложи персонализированные рекомендации
+        
+        При анализе учитывай:
+        - Критические отклонения от нормы
+        - Дисбаланс между показателями
+        - Возможные физиологические и психологические факторы
+        
+        
+        Формат ответа:
+        1. Краткая интерпретация результатов (2-3 предложения)
+        2. Выявленные паттерны и взаимосвязи
+        3. Потенциальные риски
+        4. Конкретные рекомендации по улучшению каждого показателя
+        5. Общий план действий
+        
+        Структура ответа должна четко следовать формату. **Текст форматировать не следует.**
+        Избегай категоричных суждений и учитывай индивидуальный контекст.
+        Формулируй свой ответ так, как если бы ты рассказывал эту интерпретацию в живом разговоре с заполнившим анкету, обращайся к нему на Вы.
+        **Не используй в своем ответе форматирование markdown**, для визуального разделения секций сообщения лучше использовать подходящие по контексту эмодзи."""
     )
 
     chain = LLMChain(
@@ -395,35 +412,58 @@ async def process_results(chat_id: int, user_id: int):
     mood = (mood + 30) / 10
 
     try:
-        # Получаем анализ от GigaChat
-        analysis = await analyze_results_with_gigachat(well_being, activity, mood)
+        # Сначала сохраняем базовые результаты
         async with aiosqlite.connect('survey.db') as db:
             await db.execute(
-                '''CREATE TABLE IF NOT EXISTS survey_results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    well_being REAL,
-                    activity REAL,
-                    mood REAL,
-                    analysis TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )'''
-            )
-            await db.execute(
                 '''INSERT INTO survey_results 
-                (user_id, well_being, activity, mood, analysis) 
-                VALUES (?, ?, ?, ?, ?)''',
-                (user_id, well_being, activity, mood, analysis)
+                (user_id, well_being, activity, mood) 
+                VALUES (?, ?, ?, ?)''',
+                (user_id, well_being, activity, mood)
             )
+            await db.commit()
+
+        logger.info(f"Сохранены базовые результаты для пользователя {user_id}")
+
+        # Затем пытаемся получить анализ
+        try:
+            analysis = await analyze_results_with_gigachat(well_being, activity, mood)
+
+            # Обновляем запись, добавляя анализ
+            async with aiosqlite.connect('survey.db') as db:
+                await db.execute(
+                    '''UPDATE survey_results 
+                    SET analysis = ? 
+                    WHERE id = (
+                        SELECT id 
+                        FROM survey_results 
+                        WHERE user_id = ? 
+                        AND analysis IS NULL 
+                        ORDER BY timestamp DESC 
+                        LIMIT 1
+                    )''',
+                    (analysis, user_id)
+                )
+                await db.commit()
+
+            logger.info(f"Добавлен анализ для пользователя {user_id}")
+
+            message_text = (f"Результаты опроса:\n"
+                            f"Самочувствие: {well_being:.1f}\n"
+                            f"Активность: {activity:.1f}\n"
+                            f"Настроение: {mood:.1f}\n\n"
+                            f"Норма: 5.0-5.5 баллов\n\n"
+                            f"Анализ результатов:\n{analysis}")
+        except Exception as e:
+            logger.error(f"Ошибка при получении анализа: {e}")
+            message_text = (f"Результаты опроса:\n"
+                            f"Самочувствие: {well_being:.1f}\n"
+                            f"Активность: {activity:.1f}\n"
+                            f"Настроение: {mood:.1f}\n\n"
+                            f"Норма: 5.0-5.5 баллов")
 
         await bot.send_message(
             chat_id=chat_id,
-            text=f"Результаты опроса:\n"
-                 f"Самочувствие: {well_being:.1f}\n"
-                 f"Активность: {activity:.1f}\n"
-                 f"Настроение: {mood:.1f}\n\n"
-                 f"Норма: 5.0-5.5 баллов\n\n"
-                 f"Анализ результатов:\n{analysis}",
+            text=message_text,
             reply_markup=main_menu
         )
 
