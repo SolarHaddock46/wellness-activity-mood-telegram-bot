@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMarkup,
-                           InlineKeyboardButton, Message, ReplyKeyboardRemove)
+                           InlineKeyboardButton, Message, ReplyKeyboardRemove, BotCommand)
 import aiosqlite
 from dotenv import load_dotenv
 import os
@@ -142,7 +142,6 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-
 rating_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text=str(i), callback_data=f"rate:{i}")
@@ -150,6 +149,13 @@ rating_keyboard = InlineKeyboardMarkup(
     ]
 )
 
+async def set_commands():
+    commands = [
+        BotCommand(command="start", description="Начать работу"),
+        BotCommand(command="help", description="Справка"),
+        BotCommand(command="register", description="Регистрация"),
+    ]
+    await bot.set_my_commands(commands)
 
 # Вспомогательный класс для хранения ответов
 class UserResponse:
@@ -363,6 +369,14 @@ async def process_rating(callback_query: types.CallbackQuery, state: FSMContext)
     else:
         await process_results(callback_query.message.chat.id, user_id)
 
+# Обработчик для неправильного ввода
+@dp.message()
+async def handle_invalid_input(message: Message):
+    """Обработка неправильного ввода пользователя"""
+    await message.answer(
+        "Извините, я не совсем понял, что вы хотите. 🤔",
+        reply_markup=main_menu
+    )
 
 async def send_question(chat_id: int, user_id: int):
     user_response = user_responses[user_id]
@@ -638,6 +652,7 @@ async def main():
     scheduler.start()
 
     # Запускаем бота
+    await set_commands()
     await dp.start_polling(bot)
 
 
