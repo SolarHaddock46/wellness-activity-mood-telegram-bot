@@ -42,7 +42,7 @@ dp = Dispatcher(storage=storage)
 scheduler = AsyncIOScheduler()
 
 
-# FSM States
+# FSM
 class RegistrationForm(StatesGroup):
     name = State()
 
@@ -163,7 +163,6 @@ class UserResponse:
         self.current_question = 0
         self.answers = {}
 
-
 # Хранилище ответов пользователей
 user_responses = {}
 
@@ -176,7 +175,6 @@ except Exception as e:
     questions_df = None
     TOTAL_QUESTIONS = 0
 
-
 # Функции баз данных
 async def create_user_database():
     async with aiosqlite.connect('users.db') as db:
@@ -188,7 +186,6 @@ async def create_user_database():
             )"""
         )
         await db.commit()
-
 
 async def init_db():
     async with aiosqlite.connect('survey.db') as db:
@@ -204,7 +201,6 @@ async def init_db():
             )'''
         )
         await db.commit()
-
 
 # Обработчики команд
 @dp.message(Command("start"))
@@ -271,10 +267,9 @@ async def cmd_register(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove()
         )
 
-
 @dp.message(StateFilter(RegistrationForm.name))
 async def process_name(message: Message, state: FSMContext):
-    # Игнорируем все команды во время регистрации кроме /cancel
+    # Игнорируем все команды во время регистрации
     if message.text.startswith('/'):
         return
 
@@ -306,7 +301,6 @@ async def process_name(message: Message, state: FSMContext):
             "Произошла ошибка при регистрации. Пожалуйста, попробуйте еще раз.",
             reply_markup=ReplyKeyboardRemove()
         )
-
 
 @dp.message(F.text == "Начать опрос")
 async def start_survey(message: Message, state: FSMContext):
@@ -340,7 +334,7 @@ async def start_survey(message: Message, state: FSMContext):
     else:
         await message.answer("Извините, в данный момент опрос недоступен. Попробуйте позже.")
 
-
+# Отображение истории заполнения опросника
 @dp.message(F.text == "Мои результаты")
 async def show_results(message: Message):
     user_id = message.from_user.id
@@ -374,10 +368,9 @@ async def show_results(message: Message):
         logger.error(f"Ошибка при получении результатов: {e}")
         await message.answer("Произошла ошибка при получении результатов. Попробуйте позже.")
 
-
+# Анализ трендов в изменении показателей САН
 @dp.message(F.text == "Анализ динамики")
 async def cmd_analyze_trends(message: Message):
-    """Анализ трендов в изменении показателей САН"""
     user_id = message.from_user.id
 
     # Проверяем регистрацию пользователя
@@ -396,7 +389,7 @@ async def cmd_analyze_trends(message: Message):
 
     await analyze_trends_with_gigachat(message.chat.id, user_id)
 
-
+# Обработчик ответов пользователя при опросе
 @dp.callback_query(lambda c: c.data.startswith("rate:"))
 async def process_rating(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
@@ -420,12 +413,12 @@ async def process_rating(callback_query: types.CallbackQuery, state: FSMContext)
 # Обработчик для неправильного ввода
 @dp.message()
 async def handle_invalid_input(message: Message):
-    """Обработка неправильного ввода пользователя"""
     await message.answer(
         "Извините, я не совсем поняла, что вы хотите. 🤔",
         reply_markup=main_menu
     )
 
+# Отправка вопроса пользователю
 async def send_question(chat_id: int, user_id: int):
     user_response = user_responses[user_id]
     if user_response.current_question < TOTAL_QUESTIONS:
@@ -437,7 +430,7 @@ async def send_question(chat_id: int, user_id: int):
             reply_markup=rating_keyboard
         )
 
-
+# Анализ результатов единичного заполнения опросника
 async def analyze_results_with_gigachat(well_being: float, activity: float, mood: float) -> str:
     prompt = PromptTemplate(
         input_variables=["well_being", "activity", "mood"],
@@ -485,7 +478,7 @@ async def analyze_results_with_gigachat(well_being: float, activity: float, mood
 
     return result
 
-
+# Расчет значений результатов
 async def process_results(chat_id: int, user_id: int):
     user_response = user_responses[user_id]
 
@@ -563,6 +556,7 @@ async def process_results(chat_id: int, user_id: int):
     finally:
         del user_responses[user_id]
 
+# Функция анализа трендов в последних 5 заполнениях
 async def analyze_trends_with_gigachat(chat_id: int, user_id: int, num_last_results: int = 5) -> None:
     try:
         # Получаем последние результаты из БД
@@ -643,9 +637,8 @@ async def analyze_trends_with_gigachat(chat_id: int, user_id: int, num_last_resu
         )
 
 
-# Напоминания
+# Отправка напоминаний всем зарегистрированным пользователям
 async def send_reminder():
-    """Отправка напоминаний всем зарегистрированным пользователям"""
     try:
         async with aiosqlite.connect('users.db') as db:
             async with db.execute("SELECT user_id, name FROM users") as cursor:
