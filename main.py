@@ -364,7 +364,6 @@ async def show_results(message: Message):
                     f"Самочувствие: {well_being:.1f}\n"
                     f"Активность: {activity:.1f}\n"
                     f"Настроение: {mood:.1f}\n"
-                    f"Анализ: {analysis}\n"
                     f"{'=' * 20}\n"
                 )
             response += "\nНорма: 5.0-5.5 баллов"
