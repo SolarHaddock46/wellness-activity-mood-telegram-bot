@@ -137,7 +137,8 @@ main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Начать опрос")],
         [KeyboardButton(text="Мои результаты")],
-        [KeyboardButton(text="Анализ динамики")]
+        [KeyboardButton(text="Анализ динамики")],
+        [KeyboardButton(text="Отправить отзыв")]
     ],
     resize_keyboard=True
 )
@@ -163,6 +164,10 @@ class UserResponse:
         self.current_question = 0
         self.answers = {}
 
+# FSM для сбора отзывов
+class FeedbackForm(StatesGroup):
+    waiting_for_feedback = State()
+
 # Хранилище ответов пользователей
 user_responses = {}
 
@@ -183,6 +188,18 @@ async def create_user_database():
                 user_id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        await db.commit()
+
+async def create_feedback_database():
+    async with aiosqlite.connect('feedback.db') as db:
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                feedback TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )"""
         )
         await db.commit()
@@ -410,13 +427,58 @@ async def process_rating(callback_query: types.CallbackQuery, state: FSMContext)
     else:
         await process_results(callback_query.message.chat.id, user_id)
 
-# Обработчик для неправильного ввода
+# Обработчик состояния для отправки отзыва
+@dp.message(F.text.in_({"Отправить отзыв"}))
+async def start_feedback(message: Message, state: FSMContext):
+    # Запрашиваем отзыв у пользователя
+    await message.answer("Пожалуйста, напишите ваш отзыв. Мы будем признательны за ваши комментарии!")
+    await state.set_state(FeedbackForm.waiting_for_feedback)
+
+@dp.message(FeedbackForm.waiting_for_feedback)
+async def process_feedback(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    feedback_text = message.text
+
+    # Попытка сохранить отзыв в базе данных
+    try:
+        async with aiosqlite.connect('feedback.db') as db:
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    feedback TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            await db.execute(
+                "INSERT INTO feedback (user_id, feedback) VALUES (?, ?)",
+                (user_id, feedback_text)
+            )
+            await db.commit()
+
+        await message.answer(
+            "Спасибо за ваш отзыв! Мы ценим ваше мнение.",
+            reply_markup=main_menu
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении отзыва: {e}")
+        await message.answer(
+            "Произошла ошибка при сохранении вашего отзыва. Пожалуйста, попробуйте позже.",
+            reply_markup=main_menu
+        )
+
+    # Очищаем состояние после обработки отзыва
+    await state.clear()
+
 @dp.message()
-async def handle_invalid_input(message: Message):
-    await message.answer(
-        "Извините, я не совсем поняла, что вы хотите. 🤔",
-        reply_markup=main_menu
-    )
+async def handle_invalid_input(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != FeedbackForm.waiting_for_feedback:
+        await message.answer(
+            "Извините, я не совсем поняла, что вы хотите. 🤔",
+            reply_markup=main_menu
+        )
 
 # Отправка вопроса пользователю
 async def send_question(chat_id: int, user_id: int):
@@ -682,6 +744,7 @@ async def main():
     # Создаем базы данных
     await create_user_database()
     await init_db()
+    await create_feedback_database()
 
     # Регистрируем middleware
     dp.message.middleware.register(RegistrationMiddleware())
